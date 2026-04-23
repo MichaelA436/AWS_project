@@ -1,0 +1,88 @@
+import json
+import os
+import time
+import boto3
+
+redshift_data = boto3.client("redshift-data")
+
+WORKGROUP_NAME = os.environ["REDSHIFT_WORKGROUP"]
+DATABASE = os.environ["REDSHIFT_DATABASE"]
+SECRET_ARN = os.environ["REDSHIFT_SECRET_ARN"]
+
+# All materialized views you created
+MV_REFRESH_STATEMENTS = [
+    "REFRESH MATERIALIZED VIEW public.mv_dau;",
+    "REFRESH MATERIALIZED VIEW public.mv_daily_watch_time;",
+    "REFRESH MATERIALIZED VIEW public.mv_top_movies;",
+    "REFRESH MATERIALIZED VIEW public.mv_device_usage;",
+    "REFRESH MATERIALIZED VIEW public.mv_country_watch_patterns;",
+    "REFRESH MATERIALIZED VIEW public.mv_user_engagement;",
+    "REFRESH MATERIALIZED VIEW public.mv_genre_popularity;",
+    "REFRESH MATERIALIZED VIEW public.mv_completion_rate;",
+    "REFRESH MATERIALIZED VIEW public.mv_ratings_vs_popularity;"
+]
+
+
+def wait_for_statement(statement_id, max_wait_seconds=600):
+    start = time.time()
+
+    while True:
+        resp = redshift_data.describe_statement(Id=statement_id)
+        status = resp["Status"]
+
+        if status == "FINISHED":
+            return resp
+
+        if status in ["FAILED", "ABORTED"]:
+            raise RuntimeError(
+                f"Statement failed: {resp.get('Error', 'Unknown error')}"
+            )
+
+        if time.time() - start > max_wait_seconds:
+            raise TimeoutError(
+                f"Statement {statement_id} timed out after {max_wait_seconds} seconds"
+            )
+
+        time.sleep(2)
+
+
+def run_sql(sql):
+    response = redshift_data.execute_statement(
+        WorkgroupName=WORKGROUP_NAME,
+        Database=DATABASE,
+        SecretArn=SECRET_ARN,
+        Sql=sql
+    )
+    statement_id = response["Id"]
+    final_status = wait_for_statement(statement_id)
+    return statement_id, final_status
+
+
+def lambda_handler(event, context):
+    try:
+        results = []
+
+        for sql in MV_REFRESH_STATEMENTS:
+            stmt_id, status = run_sql(sql)
+            results.append({
+                "sql": sql,
+                "statement_id": stmt_id,
+                "status": status["Status"]
+            })
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "All materialized views refreshed successfully",
+                "results": results
+            })
+        }
+
+    except Exception as e:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "message": "Materialized view refresh failed",
+                "error": str(e)
+            })
+        }
