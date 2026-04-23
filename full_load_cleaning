@@ -1,0 +1,188 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsgluedq.transforms import EvaluateDataQuality
+from awsglue.dynamicframe import DynamicFrame
+from awsglue import DynamicFrame
+from pyspark.sql.functions import trim, col
+
+def sparkSqlQuery(glueContext, query, mapping, transformation_ctx) -> DynamicFrame:
+    for alias, frame in mapping.items():
+        frame.toDF().createOrReplaceTempView(alias)
+    result = spark.sql(query)
+    return DynamicFrame.fromDF(result, glueContext, transformation_ctx)
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+DEFAULT_DATA_QUALITY_RULESET = """
+    Rules = [
+        ColumnCount > 0
+    ]
+"""
+
+# ============================================================
+# USERS CLEANING
+# ============================================================
+
+Users_raw = glueContext.create_dynamic_frame.from_options(
+    format_options={"withHeader": True, "separator": ","},
+    connection_type="s3",
+    format="csv",
+    connection_options={"paths": ["s3://michael1-s3-bucket/bronze/toprocess/users/"]},
+    transformation_ctx="Users_raw"
+)
+
+Users_mapped = ApplyMapping.apply(
+    frame=Users_raw,
+    mappings=[
+        ("user_id", "string", "user_id", "string"),
+        ("email", "string", "email", "string"),
+        ("first_name", "string", "first_name", "string"),
+        ("last_name", "string", "last_name", "string"),
+        ("age", "string", "age", "double"),
+        ("gender", "string", "gender", "string"),
+        ("country", "string", "country", "string"),
+        ("state_province", "string", "state_province", "string"),
+        ("city", "string", "city", "string"),
+        ("subscription_plan", "string", "subscription_plan", "string"),
+        ("subscription_start_date", "string", "subscription_start_date", "date"),
+        ("is_active", "string", "is_active", "boolean"),
+        ("monthly_spend", "string", "monthly_spend", "double"),
+        ("primary_device", "string", "primary_device", "string"),
+        ("household_size", "string", "household_size", "double"),
+        ("created_at", "string", "created_at", "timestamp")
+    ],
+    transformation_ctx="Users_mapped"
+)
+
+Users_clean = DynamicFrame.fromDF(
+    Users_mapped.toDF().dropDuplicates(["user_id", "created_at"]),
+    glueContext,
+    "Users_clean"
+)
+
+EvaluateDataQuality().process_rows(
+    frame=Users_clean,
+    ruleset=DEFAULT_DATA_QUALITY_RULESET,
+    publishing_options={"dataQualityEvaluationContext": "DQ_users", "enableDataQualityResultsPublishing": True},
+)
+
+glueContext.write_dynamic_frame.from_options(
+    frame=Users_clean,
+    connection_type="s3",
+    format="glueparquet",
+    connection_options={"path": "s3://michael1-s3-bucket/silver/users/", "partitionKeys": []},
+    format_options={"compression": "snappy"},
+    transformation_ctx="Users_to_Silver"
+)
+
+# ============================================================
+# MOVIES CLEANING
+# ============================================================
+
+Movies_raw = glueContext.create_dynamic_frame.from_options(
+    format_options={"withHeader": True, "separator": ","},
+    connection_type="s3",
+    format="csv",
+    connection_options={"paths": ["s3://michael1-s3-bucket/bronze/toprocess/movies/"]},
+    transformation_ctx="Movies_raw"
+)
+
+Movies_mapped = ApplyMapping.apply(
+    frame=Movies_raw,
+    mappings=[
+        ("movie_id", "string", "movie_id", "string"),
+        ("title", "string", "title", "string"),
+        ("content_type", "string", "content_type", "string"),
+        ("genre_primary", "string", "genre_primary", "string"),
+        ("release_year", "string", "release_year", "int"),
+        ("duration_minutes", "string", "duration_minutes", "double"),
+        ("country_of_origin", "string", "country_of_origin", "string"),
+        ("imdb_rating", "string", "imdb_rating", "double"),
+        ("is_netflix_original", "string", "is_netflix_original", "boolean"),
+        ("added_to_platform", "string", "added_to_platform", "date"),
+        ("content_warning", "string", "content_warning", "boolean")
+    ],
+    transformation_ctx="Movies_mapped"
+)
+
+Movies_clean = DynamicFrame.fromDF(
+    Movies_mapped.toDF().dropDuplicates(["movie_id", "added_to_platform"]),
+    glueContext,
+    "Movies_clean"
+)
+
+EvaluateDataQuality().process_rows(
+    frame=Movies_clean,
+    ruleset=DEFAULT_DATA_QUALITY_RULESET,
+    publishing_options={"dataQualityEvaluationContext": "DQ_movies", "enableDataQualityResultsPublishing": True},
+)
+
+glueContext.write_dynamic_frame.from_options(
+    frame=Movies_clean,
+    connection_type="s3",
+    format="glueparquet",
+    connection_options={"path": "s3://michael1-s3-bucket/silver/movies/", "partitionKeys": []},
+    format_options={"compression": "snappy"},
+    transformation_ctx="Movies_to_Silver"
+)
+
+# ============================================================
+# WATCH_HISTORY_INITIAL_LOAD CLEANING
+# ============================================================
+
+Watch_raw = glueContext.create_dynamic_frame.from_options(
+    format_options={"withHeader": True, "separator": ","},
+    connection_type="s3",
+    format="csv",
+    connection_options={"paths": ["s3://michael1-s3-bucket/bronze/toprocess/watch_history_initial_load/"]},
+    transformation_ctx="Watch_raw"
+)
+
+Watch_df = Watch_raw.toDF()
+
+Watch_clean_df = (
+    Watch_df
+    .withColumn("session_id", trim(col("session_id")))
+    .withColumn("user_id", trim(col("user_id")))
+    .withColumn("movie_id", trim(col("movie_id")))
+    .withColumn("watch_date", col("watch_date").cast("date"))
+    .withColumn("device_type", trim(col("device_type")))
+    .withColumn("watch_duration_minutes", col("watch_duration_minutes").cast("double"))
+    .withColumn("progress_percentage", col("progress_percentage").cast("double"))
+    .withColumn("action", trim(col("action")))
+    .withColumn("quality", trim(col("quality")))
+    .withColumn("location_country", trim(col("location_country")))
+    .withColumn("is_download", col("is_download").cast("boolean"))
+    .withColumn("user_rating", col("user_rating").cast("int"))
+    .dropDuplicates(["session_id", "user_id", "movie_id", "watch_date"])
+)
+
+Watch_clean = DynamicFrame.fromDF(Watch_clean_df, glueContext, "Watch_clean")
+
+EvaluateDataQuality().process_rows(
+    frame=Watch_clean,
+    ruleset=DEFAULT_DATA_QUALITY_RULESET,
+    publishing_options={"dataQualityEvaluationContext": "DQ_watch_history", "enableDataQualityResultsPublishing": True},
+)
+
+glueContext.write_dynamic_frame.from_options(
+    frame=Watch_clean,
+    connection_type="s3",
+    format="glueparquet",
+    connection_options={"path": "s3://michael1-s3-bucket/silver/watch_history/", "partitionKeys": ["watch_date"]},
+    format_options={"compression": "snappy"},
+    transformation_ctx="Watch_to_Silver"
+)
+
+# ============================================================
+
+job.commit()
