@@ -1,0 +1,77 @@
+import sys
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+
+# ---------------------------------------------------------
+# Spark + Glue setup
+# ---------------------------------------------------------
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+# ---------------------------------------------------------
+# JDBC connection
+# ---------------------------------------------------------
+jdbc_url = "jdbc:postgresql://13.42.152.118:5432/testdb"
+connection_properties = {
+    "user": "admin",
+    "password": "admin123",
+    "driver": "org.postgresql.Driver"
+}
+
+# ---------------------------------------------------------
+# S3 output paths
+# ---------------------------------------------------------
+BUCKET = "michael1-s3-bucket"
+BRONZE = f"s3://{BUCKET}/bronze/toprocess"
+
+# ---------------------------------------------------------
+# Helper: Read table via JDBC
+# ---------------------------------------------------------
+def read_table(table_name):
+    print(f"Reading table: {table_name}")
+    return (
+        spark.read
+            .format("jdbc")
+            .option("url", jdbc_url)
+            .option("dbtable", table_name)
+            .options(**connection_properties)
+            .load()
+    )
+
+# ---------------------------------------------------------
+# Helper: Write CSV to S3
+# ---------------------------------------------------------
+def write_csv(df, filename):
+    output_path = f"{BRONZE}/{filename}"
+    print(f"Writing to: {output_path}")
+    (
+        df.coalesce(1)  # optional: single CSV file
+          .write
+          .mode("overwrite")
+          .option("header", True)
+          .csv(output_path)
+    )
+
+# ---------------------------------------------------------
+# FULL LOAD INGESTION
+# ---------------------------------------------------------
+
+# Movies
+movies_df = read_table("michael.movies")
+write_csv(movies_df, "movies")
+
+# Users
+users_df = read_table("michael.users")
+write_csv(users_df, "users")
+
+# Watch History Initial Load
+wh_initial_df = read_table("michael.watch_history_initial_load")
+write_csv(wh_initial_df, "watch_history_initial_load")
+
+print("FULL LOAD INGESTION COMPLETED SUCCESSFULLY")
+
+job.commit()
