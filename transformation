@@ -1,0 +1,81 @@
+import sys
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.context import SparkContext
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+# Load Silver
+users = spark.read.parquet("s3://michael1-s3-bucket/silver/users")
+movies = spark.read.parquet("s3://michael1-s3-bucket/silver/movies")
+watch = spark.read.parquet("s3://michael1-s3-bucket/silver/watch_history")
+
+# ---------------------------
+# FACT TABLE
+# ---------------------------
+fact_watch_history = watch.select(
+    "session_id",
+    "user_id",
+    "movie_id",
+    "watch_date",
+    "device_type",
+    "location_country",
+    "watch_duration_minutes",
+    "progress_percentage",
+    "is_download",
+    "user_rating"
+)
+
+fact_watch_history.write.mode("overwrite").parquet("s3://michael1-s3-bucket/gold/fact_watch_history")
+
+# ---------------------------
+# DIM USERS
+# ---------------------------
+dim_users = users.dropDuplicates(["user_id"])
+dim_users.write.mode("overwrite").parquet("s3://michael1-s3-bucket/gold/dim_users")
+
+# ---------------------------
+# DIM MOVIES
+# ---------------------------
+dim_movies = movies.dropDuplicates(["movie_id"])
+dim_movies.write.mode("overwrite").parquet("s3://michael1-s3-bucket/gold/dim_movies")
+
+# ---------------------------
+# DIM DATE
+# ---------------------------
+from pyspark.sql.functions import year, month, dayofmonth, dayofweek, weekofyear
+
+dim_date = (
+    watch.select("watch_date")
+    .dropDuplicates()
+    .withColumn("year", year("watch_date"))
+    .withColumn("month", month("watch_date"))
+    .withColumn("day", dayofmonth("watch_date"))
+    .withColumn("day_of_week", dayofweek("watch_date"))
+    .withColumn("week_of_year", weekofyear("watch_date"))
+)
+
+dim_date.write.mode("overwrite").parquet("s3://michael1-s3-bucket/gold/dim_date")
+
+# ---------------------------
+# DIM DEVICE
+# ---------------------------
+dim_device = (
+    watch.select("device_type")
+    .dropDuplicates()
+)
+
+dim_device.write.mode("overwrite").parquet("s3://michael1-s3-bucket/gold/dim_device")
+
+# ---------------------------
+# DIM LOCATION
+# ---------------------------
+dim_location = (
+    watch.select("location_country")
+    .dropDuplicates()
+)
+
+dim_location.write.mode("overwrite").parquet("s3://michael1-s3-bucket/gold/dim_location")
