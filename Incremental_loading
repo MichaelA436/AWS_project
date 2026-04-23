@@ -1,0 +1,91 @@
+import sys
+import boto3
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.context import SparkContext
+from pyspark.sql.functions import col, max as spark_max
+
+# Initialize Glue
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+# DynamoDB setup
+dynamodb = boto3.resource("dynamodb")
+WATERMARK_TABLE = "watch_history_watermark"
+WATERMARK_PK = "watch_history"
+
+# S3 output
+BUCKET = "michael1-s3-bucket"
+PREFIX = "bronze/toprocess/watch_history/"
+
+# PostgreSQL connection
+jdbc_url = "jdbc:postgresql://13.42.152.118:5432/testdb"
+connection_properties = {
+    "user": "admin",
+    "password": "admin123",
+    "driver": "org.postgresql.Driver"
+}
+
+def get_watermark():
+    table = dynamodb.Table(WATERMARK_TABLE)
+    response = table.get_item(Key={"pk": WATERMARK_PK})
+    if "Item" in response:
+        return response["Item"]["last_watch_date"]
+    return "1900-01-01"
+
+def update_watermark(new_date):
+    table = dynamodb.Table(WATERMARK_TABLE)
+    table.put_item(
+        Item={
+            "pk": WATERMARK_PK,
+            "last_watch_date": new_date
+        }
+    )
+
+# Read watermark
+last_date = get_watermark()
+
+if last_date is None:
+    raise Exception("Watermark missing in DynamoDB")
+
+print(f"Current watermark: {last_date}")
+
+# Read incremental rows
+query = f"(SELECT * FROM michael.watch_history_incremental_load WHERE watch_date > '{last_date}') AS wh"
+
+df = (
+    spark.read
+        .format("jdbc")
+        .option("url", jdbc_url)
+        .option("dbtable", query)
+        .options(**connection_properties)
+        .load()
+)
+
+# Cast watch_date safely
+df = df.withColumn("watch_date", col("watch_date").cast("date"))
+
+# Fast empty check
+if df.rdd.isEmpty():
+    print("No new rows found.")
+    job.commit()
+
+print(f"New rows found: {df.count()}")
+
+# Find new max watch_date
+new_max_date = df.select(spark_max(col("watch_date"))).collect()[0][0]
+
+# Write incremental rows to S3
+output_path = f"s3://{BUCKET}/{PREFIX}watch_history_{new_max_date}/"
+print(f"Writing incremental batch to: {output_path}")
+
+df.write.mode("overwrite").option("header", True).csv(output_path)
+
+# Update watermark
+update_watermark(str(new_max_date))
+
+print(f"Successfully ingested rows up to {new_max_date}")
+
+job.commit()
