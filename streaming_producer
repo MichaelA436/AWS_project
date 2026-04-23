@@ -1,0 +1,89 @@
+import boto3
+import json
+import uuid
+import requests
+
+TMDB_API_KEY = "53278a596b94c012e028cba7fdcac647"
+KINESIS_STREAM = "Mikes_data_stream"
+DDB_TABLE = "tmdb_page_checkpoint"
+
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table(DDB_TABLE)
+
+def to_json_safe(obj):
+    """Convert non‑serializable types (e.g., Decimal) to JSON‑safe values."""
+    try:
+        import decimal
+        if isinstance(obj, decimal.Decimal):
+            return float(obj)
+    except:
+        pass
+    return obj
+
+def lambda_handler(event, context):
+
+    kinesis = boto3.client("kinesis")
+
+    # 1. Load current page from DynamoDB
+    item = table.get_item(Key={"pk": "page_tracker"}).get("Item", {})
+    current_page = item.get("current_page", 1)
+
+    # 2. Fetch that page from TMDB
+    url = f"https://api.themoviedb.org/3/trending/movie/day?page={current_page}&api_key={TMDB_API_KEY}"
+    response = requests.get(url)
+
+    if response.status_code != 200:
+        return {
+            "statusCode": 500,
+            "body": json.dumps(f"TMDB error: {response.text}")
+        }
+
+    data = response.json()
+    print("TMDB Response:", data)
+    movies = data.get("results", [])
+
+    # 3. If no movies returned → stop streaming
+    if not movies:
+        return {
+            "statusCode": 200,
+            "body": json.dumps(f"No more pages left. Stopped at page {current_page}.")
+        }
+
+    # 4. Stream each movie into Kinesis
+    count = 0
+    for movie in movies:
+
+        message = {
+            "event_id": str(uuid.uuid4()),
+            "movie_id": movie["id"],
+            "title": movie["title"],
+            "popularity": movie.get("popularity", 0.0),
+            "vote_average": movie.get("vote_average", 0.0),
+            "release_date": movie.get("release_date"),
+            "page_number": current_page
+        }
+
+        print("SENDING TO KINESIS:", movie)
+
+
+        # FIX: json.dumps(..., default=to_json_safe)
+        kinesis.put_record(
+            StreamName=KINESIS_STREAM,
+            Data=json.dumps(message, default=to_json_safe).encode("utf-8"),
+            PartitionKey=str(movie["id"])
+        )
+
+        count += 1
+
+    # 5. Increment page number for next run
+    table.put_item(
+        Item={
+            "pk": "page_tracker",
+            "current_page": current_page + 1
+        }
+    )
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps(f"Streamed {count} movies from page {current_page}")
+    }
