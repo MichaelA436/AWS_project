@@ -1,0 +1,119 @@
+import boto3
+import os
+import json
+import time
+
+s3 = boto3.resource("s3")
+dynamodb = boto3.resource("dynamodb")
+redshift_data = boto3.client("redshift-data")
+
+BUCKET = "michael1-s3-bucket"
+WATERMARK_TABLE = "watch_history_watermark"
+
+REDSHIFT_WORKGROUP = os.environ["REDSHIFT_WORKGROUP"]
+REDSHIFT_DATABASE = os.environ["REDSHIFT_DATABASE"]
+REDSHIFT_SECRET_ARN = os.environ["REDSHIFT_SECRET_ARN"]
+
+TABLES_TO_TRUNCATE = [
+    "public.fact_watch_history",
+    "public.dim_users",
+    "public.dim_movies",
+    "public.dim_date",
+    "public.dim_device",
+    "public.dim_location"
+]
+
+MVS_TO_REFRESH = [
+    "public.mv_dau",
+    "public.mv_daily_watch_time",
+    "public.mv_top_movies",
+    "public.mv_device_usage",
+    "public.mv_country_watch_patterns",
+    "public.mv_user_engagement",
+    "public.mv_genre_popularity",
+    "public.mv_completion_rate",
+    "public.mv_ratings_vs_popularity"
+]
+
+
+def delete_prefix(bucket, prefix):
+    bucket_obj = s3.Bucket(bucket)
+
+    objects_to_delete = []
+    for obj in bucket_obj.objects.filter(Prefix=prefix):
+        if obj.key.endswith("/"):
+            continue
+        objects_to_delete.append({"Key": obj.key})
+
+        if len(objects_to_delete) == 1000:
+            bucket_obj.delete_objects(Delete={"Objects": objects_to_delete})
+            objects_to_delete = []
+
+    if objects_to_delete:
+        bucket_obj.delete_objects(Delete={"Objects": objects_to_delete})
+
+    print(f"Deleted all objects under: {prefix}")
+
+
+def reset_watermark():
+    table = dynamodb.Table(WATERMARK_TABLE)
+    table.put_item(
+        Item={
+            "pk": "watch_history",
+            "last_watch_date": "1900-01-01"
+        }
+    )
+    print("Watermark reset to 1900-01-01")
+
+
+def wait_for_statement(statement_id):
+    while True:
+        resp = redshift_data.describe_statement(Id=statement_id)
+        status = resp["Status"]
+
+        if status in ["FINISHED", "FAILED", "ABORTED"]:
+            return resp
+
+        time.sleep(1)
+
+
+def run_sql(sql):
+    response = redshift_data.execute_statement(
+        WorkgroupName=REDSHIFT_WORKGROUP,
+        Database=REDSHIFT_DATABASE,
+        SecretArn=REDSHIFT_SECRET_ARN,
+        Sql=sql
+    )
+    statement_id = response["Id"]
+    final_status = wait_for_statement(statement_id)
+
+    if final_status["Status"] != "FINISHED":
+        raise RuntimeError(f"SQL failed: {sql}")
+
+    return final_status
+
+
+def lambda_handler(event, context):
+
+    # 1. Clear S3 layers
+    delete_prefix(BUCKET, "bronze/toprocess/")
+    delete_prefix(BUCKET, "silver/")
+    delete_prefix(BUCKET, "gold/")
+
+    # 2. Reset watermark
+    reset_watermark()
+
+    # 3. Truncate Redshift tables
+    for table in TABLES_TO_TRUNCATE:
+        run_sql(f"TRUNCATE TABLE {table};")
+        print(f"Truncated: {table}")
+
+    # 4. Refresh all materialized views
+    for mv in MVS_TO_REFRESH:
+        run_sql(f"REFRESH MATERIALIZED VIEW {mv};")
+        print(f"Refreshed MV: {mv}")
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps("Full system reset complete. Ready for FULL load.")
+    }
