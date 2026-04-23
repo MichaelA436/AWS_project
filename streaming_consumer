@@ -1,0 +1,191 @@
+import boto3
+import json
+import base64
+from decimal import Decimal
+from boto3.dynamodb.conditions import Key
+from datetime import datetime
+
+# DynamoDB setup
+dynamodb = boto3.resource('dynamodb')
+movies_table = dynamodb.Table("tmdb_trending_movies")
+top10_table = dynamodb.Table("tmdb_top10_leaderboard")
+
+
+
+# SNS setup (optional)
+sns_topic_arn = 'arn:aws:sns:eu-west-2:666127452756:mike_stream_notifications'
+sns_client = boto3.client('sns')
+
+
+def to_json_safe(obj):
+    """Convert Decimal and other non‑serializable types to JSON‑safe values."""
+    if isinstance(obj, Decimal):
+        return float(obj)
+    return obj
+
+
+def safe_decimal(value):
+    """Convert numeric values safely to DynamoDB Decimal."""
+    try:
+        return Decimal(str(value))
+    except:
+        return Decimal("0")
+
+
+def lambda_handler(event, context):
+    print("FULL EVENT:", event)
+
+    for record in event['Records']:
+        print("RAW DATA (base64):", record["kinesis"]["data"])
+
+        # Decode Base64 Kinesis payload
+        raw_data = base64.b64decode(record['kinesis']['data']).decode('utf-8')
+        print(f"Raw Kinesis Data: {raw_data}")
+
+        payload = base64.b64decode(record["kinesis"]["data"])
+        print("DECODED PAYLOAD:", payload)
+
+
+        try:
+            payload = json.loads(raw_data)
+
+            # --- CLEANING & NORMALIZATION ---
+            movie_id = str(payload.get("movie_id"))
+            title = payload.get("title", "Unknown Title")
+            popularity = safe_decimal(payload.get("popularity", 0))
+            vote_average = safe_decimal(payload.get("vote_average", 0))
+            release_date = payload.get("release_date") or None
+            page_number = safe_decimal(payload.get("page_number", 0))   # ⭐ FIXED
+
+            # Build DynamoDB item
+            item = {
+                "pk": "movie",
+                "sk": movie_id,
+                "movie_id": movie_id,
+                "title": title,
+                "popularity": popularity,
+                "vote_average": vote_average,
+                "release_date": release_date,
+                "page_number": page_number,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+
+            print("WRITING TO DYNAMODB:", item)
+            movies_table.put_item(Item=item)
+            print("WRITE SUCCESS:", item["movie_id"])
+
+        except Exception as e:
+            print(f"Error processing record: {e}")
+            continue
+
+
+    # After processing all records → compute Top 10
+    update_top_10()
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps('TMDB movie records processed successfully')
+    }
+
+
+def normalize_movie_for_dynamodb(m):
+    m = dict(m)
+
+    for key, value in m.items():
+        if isinstance(value, float):
+            m[key] = Decimal(str(value))
+        elif isinstance(value, int):
+            m[key] = Decimal(value)
+
+    return m
+
+
+def update_top_10():
+    try:
+        # 1. Query all movies
+        response = movies_table.query(
+            KeyConditionExpression=Key("pk").eq("movie")
+        )
+
+        movies = response.get("Items", [])
+
+        if len(movies) == 0:
+            print("No movies found — skipping Top 10 update.")
+            return
+
+        # 2. Sort by popularity
+        sorted_movies = sorted(
+            movies,
+            key=lambda x: x.get("popularity", Decimal("0")),
+            reverse=True
+        )
+
+        new_top10 = sorted_movies[:10]
+
+        # 3. Load old Top‑10
+        old_items = top10_table.query(
+            KeyConditionExpression=Key("pk").eq("top10")
+        ).get("Items", [])
+
+        # Convert old items into comparable structure
+        old_top10 = sorted(old_items, key=lambda x: int(x["sk"]))
+
+        # 4. Compare old vs new
+        def simplify(movie):
+
+            return {
+                "movie_id": movie["movie_id"],
+                "popularity": float(movie["popularity"]),
+                "title": movie["title"]
+            }
+
+        old_simple = [simplify(m) for m in old_top10]
+        new_simple = [simplify(m) for m in new_top10]
+
+        leaderboard_changed = old_simple != new_simple
+
+
+        # 5. If changed → send SNS
+        if leaderboard_changed:
+            message = {
+                "event": "Top 10 Leaderboard Updated",
+                "old_top10": old_simple,
+                "new_top10": new_simple,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+
+            sns_client.publish(
+                TopicArn=sns_topic_arn,
+                Message=json.dumps(message),
+                Subject="TMDB Top 10 Leaderboard Changed"
+            )
+
+            print("SNS notification sent — leaderboard changed.")
+        else:
+            print("Top 10 unchanged — no SNS sent.")
+
+        # 6. Delete old Top‑10 entries
+        for item in old_items:
+            top10_table.delete_item(
+                Key={"pk": "top10", "sk": item["sk"]}
+            )
+
+        # 7. Insert new Top‑10 entries (ranked 1–10)
+        for rank, movie in enumerate(new_top10, start=1):
+            top10_table.put_item(
+                Item={
+                    "pk": "top10",
+                    "sk": str(rank),
+                    "movie_id": movie["movie_id"],
+                    "title": movie["title"],
+                    "popularity": movie["popularity"],
+                    "vote_average": movie["vote_average"],
+                    "release_date": movie["release_date"],
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+            )
+
+        print("Top 10 leaderboard updated successfully.")
+
+    except Exception as e:
+        print(f"Error updating Top 10: {e}")
