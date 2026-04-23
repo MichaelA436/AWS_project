@@ -1,0 +1,76 @@
+import sys
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.context import SparkContext
+from pyspark.sql.functions import col, trim
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+BRONZE_PATH = "s3://michael1-s3-bucket/bronze/toprocess/watch_history/"
+SILVER_PATH = "s3://michael1-s3-bucket/silver/watch_history/"
+
+# Read raw incremental Bronze
+df_raw = spark.read.option("header", True).csv(f"{BRONZE_PATH}/*")
+
+# Skip if Bronze is empty
+if df_raw.rdd.isEmpty():
+    print("No new Bronze files found. Skipping incremental cleaning.")
+    job.commit()
+
+# Clean + cast schema
+df_clean = (
+    df_raw
+    .withColumn("session_id", trim(col("session_id")))
+    .withColumn("user_id", trim(col("user_id")))
+    .withColumn("movie_id", trim(col("movie_id")))
+    .withColumn("watch_date", col("watch_date").cast("date"))
+    .withColumn("device_type", trim(col("device_type")))
+    .withColumn("watch_duration_minutes", col("watch_duration_minutes").cast("double"))
+    .withColumn("progress_percentage", col("progress_percentage").cast("double"))
+    .withColumn("action", trim(col("action")))
+    .withColumn("quality", trim(col("quality")))
+    .withColumn("location_country", trim(col("location_country")))
+    .withColumn("is_download", col("is_download").cast("boolean"))
+    .withColumn("user_rating", col("user_rating").cast("int"))
+    .dropDuplicates(["session_id", "user_id", "movie_id", "watch_date"])
+)
+
+# Read existing Silver (if exists)
+try:
+    df_silver = spark.read.parquet(SILVER_PATH)
+    silver_exists = True
+except:
+    silver_exists = False
+
+# If Silver doesn't exist, create it
+if not silver_exists:
+    df_clean.write.mode("overwrite").partitionBy("watch_date").parquet(SILVER_PATH)
+    print("Silver table created for the first time.")
+    job.commit()
+
+# Find new rows using left_anti join
+df_new = df_clean.alias("b").join(
+    df_silver.alias("s"),
+    on=[
+        col("b.session_id") == col("s.session_id"),
+        col("b.user_id") == col("s.user_id"),
+        col("b.movie_id") == col("s.movie_id"),
+        col("b.watch_date") == col("s.watch_date")
+    ],
+    how="left_anti"
+)
+
+# Skip if no new rows
+if df_new.rdd.isEmpty():
+    print("No new rows to append to Silver.")
+    job.commit()
+
+# Append only new rows to Silver
+df_new.write.mode("append").partitionBy("watch_date").parquet(SILVER_PATH)
+
+print(f"Added {df_new.count()} new rows to Silver.")
+
+job.commit()
