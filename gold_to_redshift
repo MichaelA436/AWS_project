@@ -1,0 +1,139 @@
+import json
+import os
+import time
+import boto3
+
+redshift_data = boto3.client("redshift-data")
+
+WORKGROUP_NAME = os.environ["REDSHIFT_WORKGROUP"]
+DATABASE = os.environ["REDSHIFT_DATABASE"]
+COPY_ROLE_ARN = os.environ["REDSHIFT_ROLE"]
+SECRET_ARN = os.environ["REDSHIFT_SECRET_ARN"]
+BUCKET = "michael1-s3-bucket"
+
+LOAD_SQL_STATEMENTS = [
+    # Phase 1: truncate existing data
+    "TRUNCATE TABLE public.fact_watch_history;",
+    "TRUNCATE TABLE public.dim_users;",
+    "TRUNCATE TABLE public.dim_movies;",
+    "TRUNCATE TABLE public.dim_date;",
+    "TRUNCATE TABLE public.dim_device;",
+    "TRUNCATE TABLE public.dim_location;",
+
+    # Phase 2: load dimensions
+    f"""
+    COPY public.dim_users
+    FROM 's3://{BUCKET}/gold/dim_users/'
+    IAM_ROLE '{COPY_ROLE_ARN}'
+    FORMAT AS PARQUET;
+    """,
+
+    f"""
+    COPY public.dim_movies
+    FROM 's3://{BUCKET}/gold/dim_movies/'
+    IAM_ROLE '{COPY_ROLE_ARN}'
+    FORMAT AS PARQUET;
+    """,
+
+    f"""
+    COPY public.dim_date
+    FROM 's3://{BUCKET}/gold/dim_date/'
+    IAM_ROLE '{COPY_ROLE_ARN}'
+    FORMAT AS PARQUET;
+    """,
+
+    f"""
+    COPY public.dim_device
+    FROM 's3://{BUCKET}/gold/dim_device/'
+    IAM_ROLE '{COPY_ROLE_ARN}'
+    FORMAT AS PARQUET;
+    """,
+
+    f"""
+    COPY public.dim_location
+    FROM 's3://{BUCKET}/gold/dim_location/'
+    IAM_ROLE '{COPY_ROLE_ARN}'
+    FORMAT AS PARQUET;
+    """,
+
+    # Phase 3: load fact
+    f"""
+    COPY public.fact_watch_history
+    FROM 's3://{BUCKET}/gold/fact_watch_history/'
+    IAM_ROLE '{COPY_ROLE_ARN}'
+    FORMAT AS PARQUET;
+    """
+]
+
+
+
+def wait_for_statement(statement_id, max_wait_seconds=600):
+    start_time = time.time()
+
+    while True:
+        response = redshift_data.describe_statement(Id=statement_id)
+        status = response["Status"]
+
+        if status == "FINISHED":
+            return response
+
+        if status in ["FAILED", "ABORTED"]:
+            raise RuntimeError(
+                f"Statement failed with status {status}: {response.get('Error', 'Unknown error')}"
+            )
+
+        if time.time() - start_time > max_wait_seconds:
+            raise TimeoutError(
+                f"Statement {statement_id} timed out after {max_wait_seconds} seconds"
+            )
+
+        time.sleep(2)
+
+
+def run_batch(sqls):
+    response = redshift_data.batch_execute_statement(
+        WorkgroupName=WORKGROUP_NAME,
+        Database=DATABASE,
+        SecretArn=SECRET_ARN,
+        Sqls=sqls
+    )
+    statement_id = response["Id"]
+    final_status = wait_for_statement(statement_id)
+    return statement_id, final_status
+
+
+def run_single(sql):
+    response = redshift_data.execute_statement(
+        WorkgroupName=WORKGROUP_NAME,
+        Database=DATABASE,
+        SecretArn=SECRET_ARN,
+        Sql=sql
+    )
+    statement_id = response["Id"]
+    final_status = wait_for_statement(statement_id)
+    return statement_id, final_status
+
+
+def lambda_handler(event, context):
+    try:
+        # Phase 1: truncate + COPY in a single transactional batch
+        load_statement_id, load_status = run_batch(LOAD_SQL_STATEMENTS)
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "Redshift star-schema reload and MV refresh completed successfully",
+                "load_statement_id": load_statement_id,
+                "load_status": load_status["Status"],
+            })
+        }
+
+    except Exception as e:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "message": "Redshift reload failed",
+                "error": str(e)
+            })
+        }
+
